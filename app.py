@@ -13,8 +13,8 @@ from flask import Flask, jsonify, render_template_string, request, Response
 app = Flask(__name__)
 
 # --- CONFIGURATION ---
-TELEGRAM_BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"  # Replace with your bot token
-TELEGRAM_CHAT_ID = "YOUR_CHAT_ID_HERE"    # Replace with your chat ID
+TELEGRAM_BOT_TOKEN = "8781048492:AAGRfyo1zDDu9HCkg_FTQ_9WFn7JwfixX_c"  # Replace with your bot token
+TELEGRAM_CHAT_ID = "7882443060"    # Replace with your chat ID
 
 API_SIGN_KEY = '7h3paiw5oL901yWTNo2wiTKt5RtQ7MFP'
 
